@@ -1,0 +1,108 @@
+---
+- name: Configure HP Omen Max 16 (Fedora)
+  hosts: omen
+  become: true
+  vars:
+    rpmfusion_version: "{{ ansible_facts['distribution_major_version'] }}"
+    install_cuda: true
+
+  tasks:
+    - name: Ensure system is up to date
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_only: true
+
+    - name: Install base tools
+      ansible.builtin.dnf:
+        name:
+          - dnf-plugins-core
+          - wget
+          - curl
+          - git
+          - neovim
+          - htop
+          - lm_sensors
+          - pciutils
+          - usbutils
+        state: present
+
+    - name: Enable RPM Fusion free
+      ansible.builtin.dnf:
+        name: "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-{{ rpmfusion_version }}.noarch.rpm"
+        state: present
+
+    - name: Enable RPM Fusion nonfree
+      ansible.builtin.dnf:
+        name: "https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{{ rpmfusion_version }}.noarch.rpm"
+        state: present
+
+    # При необходимости можно добавить tainted-репо, если RPM Fusion потребует его для nvidia-open
+    # - name: Enable RPM Fusion nonfree tainted (optional for some nvidia-open builds)
+    #   ansible.builtin.dnf:
+    #     name: "rpmfusion-nonfree-release-tainted"
+    #     state: present
+
+    - name: Refresh DNF cache
+      ansible.builtin.dnf:
+        update_cache: true
+        name: dnf
+        state: present
+
+    - name: Install NVIDIA open kernel modules and userspace
+      ansible.builtin.dnf:
+        name:
+          - akmod-nvidia-open
+          - xorg-x11-drv-nvidia
+          - xorg-x11-drv-nvidia-cuda
+          - nvidia-settings
+        state: present
+
+    - name: Ensure kernel headers and build tools for akmods
+      ansible.builtin.dnf:
+        name:
+          - kernel-headers
+          - kernel-devel
+          - gcc
+          - make
+        state: present
+
+    - name: Install CUDA toolkit (optional)
+      ansible.builtin.dnf:
+        name:
+          - cuda-toolkit
+        state: present
+      when: install_cuda
+
+    - name: Install container tools (for LLM stacks)
+      ansible.builtin.dnf:
+        name:
+          - podman
+          - podman-docker
+        state: present
+
+    - name: Enable and start power-profiles-daemon
+      ansible.builtin.dnf:
+        name: power-profiles-daemon
+        state: present
+
+    - name: Enable power-profiles-daemon service
+      ansible.builtin.systemd:
+        name: power-profiles-daemon.service
+        enabled: true
+        state: started
+
+    - name: Run sensors-detect non-interactively (basic)
+      ansible.builtin.command: sensors-detect --auto
+      args:
+        creates: /etc/sysconfig/lm_sensors
+      register: sensors_detect
+      changed_when: "'No sensors were detected' not in sensors_detect.stdout"
+
+    - name: Reboot after NVIDIA driver installation
+      ansible.builtin.reboot:
+        msg: "Rebooting to load nvidia-open kernel modules"
+        connect_timeout: 60
+        reboot_timeout: 900
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
