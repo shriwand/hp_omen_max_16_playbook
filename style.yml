@@ -1,19 +1,20 @@
 ---
-- name: Configure HP Omen Max 16 (Fedora)
+- name: Configure HP Omen Max 16 on Fedora
   hosts: omen
   become: true
+  gather_facts: true
+
   vars:
-    rpmfusion_version: "{{ ansible_facts['distribution_major_version'] }}"
-    install_cuda: true
+    target_user: "{{ ansible_user_id }}"
 
   tasks:
-    - name: Ensure system is up to date
+    - name: Update all packages
       ansible.builtin.dnf:
         name: "*"
         state: latest
         update_only: true
 
-    - name: Install base tools
+    - name: Install base packages
       ansible.builtin.dnf:
         name:
           - dnf-plugins-core
@@ -22,34 +23,42 @@
           - git
           - neovim
           - htop
-          - lm_sensors
           - pciutils
           - usbutils
+          - gcc
+          - gcc-c++
+          - make
+          - cmake
+          - kernel-headers
+          - kernel-devel
+          - dkms
+          - python3-pip
+          - python3-virtualenv
+          - uv
+          - podman
+          - podman-docker
         state: present
 
-    - name: Enable RPM Fusion free
-      ansible.builtin.dnf:
-        name: "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-{{ rpmfusion_version }}.noarch.rpm"
-        state: present
+    - name: Check whether RPM Fusion free repo is already installed
+      ansible.builtin.command: rpm -q rpmfusion-free-release
+      register: rpmfusion_free_check
+      changed_when: false
+      failed_when: false
 
-    - name: Enable RPM Fusion nonfree
-      ansible.builtin.dnf:
-        name: "https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{{ rpmfusion_version }}.noarch.rpm"
-        state: present
+    - name: Bootstrap RPM Fusion free and nonfree with nogpgcheck
+      ansible.builtin.command: >
+        dnf install -y --nogpgcheck
+        https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
+        https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
+      args:
+        executable: /bin/bash
+      when: rpmfusion_free_check.rc != 0
 
-    # При необходимости можно добавить tainted-репо, если RPM Fusion потребует его для nvidia-open
-    # - name: Enable RPM Fusion nonfree tainted (optional for some nvidia-open builds)
-    #   ansible.builtin.dnf:
-    #     name: "rpmfusion-nonfree-release-tainted"
-    #     state: present
-
-    - name: Refresh DNF cache
+    - name: Refresh metadata after enabling RPM Fusion
       ansible.builtin.dnf:
         update_cache: true
-        name: dnf
-        state: present
 
-    - name: Install NVIDIA open kernel modules and userspace
+    - name: Install NVIDIA open driver stack
       ansible.builtin.dnf:
         name:
           - akmod-nvidia-open
@@ -57,52 +66,49 @@
           - xorg-x11-drv-nvidia-cuda
           - nvidia-settings
         state: present
+        allowerasing: true
 
-    - name: Ensure kernel headers and build tools for akmods
+    - name: Install tuned for power management (Fedora 41+ default)
       ansible.builtin.dnf:
-        name:
-          - kernel-headers
-          - kernel-devel
-          - gcc
-          - make
+        name: tuned
         state: present
 
-    - name: Install CUDA toolkit (optional)
-      ansible.builtin.dnf:
-        name:
-          - cuda-toolkit
-        state: present
-      when: install_cuda
-
-    - name: Install container tools (for LLM stacks)
-      ansible.builtin.dnf:
-        name:
-          - podman
-          - podman-docker
-        state: present
-
-    - name: Enable and start power-profiles-daemon
-      ansible.builtin.dnf:
-        name: power-profiles-daemon
-        state: present
-
-    - name: Enable power-profiles-daemon service
+    - name: Enable and start tuned service
       ansible.builtin.systemd:
-        name: power-profiles-daemon.service
+        name: tuned.service
         enabled: true
         state: started
 
-    - name: Run sensors-detect non-interactively (basic)
-      ansible.builtin.command: sensors-detect --auto
-      args:
-        creates: /etc/sysconfig/lm_sensors
-      register: sensors_detect
-      changed_when: "'No sensors were detected' not in sensors_detect.stdout"
+    - name: Set performance profile for gaming/AI workloads
+      ansible.builtin.command: tuned-adm profile accelerator-performance
+      register: tuned_profile_result
+      changed_when: false
+      failed_when: false
 
-    - name: Reboot after NVIDIA driver installation
-      ansible.builtin.reboot:
-        msg: "Rebooting to load nvidia-open kernel modules"
-        connect_timeout: 60
-        reboot_timeout: 900
-        pre_reboot_delay: 5
-        post_reboot_delay: 20
+    - name: Alternative - Set performance profile (if accelerator-performance not available)
+      ansible.builtin.command: tuned-adm profile high-performance
+      register: tuned_profile_alt_result
+      changed_when: false
+      failed_when: false
+      when: tuned_profile_result.rc != 0
+
+    - name: Run sensors-detect automatically
+      ansible.builtin.command: sensors-detect --auto
+      register: sensors_detect_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set CapsLock as Ctrl for GNOME user
+      ansible.builtin.command:
+        cmd: gsettings set org.gnome.desktop.input-sources xkb-options "['ctrl:nocaps']"
+      environment:
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ansible_facts['user_uid'] }}/bus"
+      changed_when: true
+
+#   - name: Reboot to load NVIDIA kernel modules
+#     ansible.builtin.reboot:
+#       msg: "Rebooting after NVIDIA driver installation"
+#       connect_timeout: 60
+#       reboot_timeout: 900
+#       pre_reboot_delay: 5
+#       post_reboot_delay: 20

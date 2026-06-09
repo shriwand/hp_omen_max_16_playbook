@@ -1,0 +1,128 @@
+- name: Install Ollama and Open WebUI on Fedora
+  hosts: all
+  become: true
+  vars:
+    ollama_listen: "0.0.0.0:11434"
+    open_webui_port: 3000
+    open_webui_dir: /opt/open-webui
+    open_webui_user: openwebui
+    open_webui_group: openwebui
+
+  tasks:
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name:
+          - curl
+          - podman
+          - python3-libselinux
+        state: present
+        update_cache: true
+
+    - name: Create group for Open WebUI
+      ansible.builtin.group:
+        name: "{{ open_webui_group }}"
+        system: true
+        state: present
+
+    - name: Create user for Open WebUI
+      ansible.builtin.user:
+        name: "{{ open_webui_user }}"
+        group: "{{ open_webui_group }}"
+        system: true
+        create_home: false
+        shell: /sbin/nologin
+        state: present
+
+    - name: Create Open WebUI directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ open_webui_user }}"
+        group: "{{ open_webui_group }}"
+        mode: "0755"
+      loop:
+        - "{{ open_webui_dir }}"
+        - "{{ open_webui_dir }}/data"
+
+    - name: Install Ollama
+      ansible.builtin.shell: |
+        set -o pipefail
+        curl -fsSL https://ollama.com/install.sh | sh
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/ollama
+
+    - name: Create Ollama systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/ollama.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Configure Ollama listen address
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ollama.service.d/override.conf
+        mode: "0644"
+        content: |
+          [Service]
+          Environment="OLLAMA_HOST={{ ollama_listen }}"
+          Environment="OLLAMA_ORIGINS=*"
+
+    - name: Reload systemd after Ollama override
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start Ollama
+      ansible.builtin.systemd:
+        name: ollama
+        enabled: true
+        state: started
+
+    - name: Create quadlet directory
+      ansible.builtin.file:
+        path: /etc/containers/systemd
+        state: directory
+        mode: "0755"
+
+    - name: Deploy Open WebUI quadlet
+      ansible.builtin.copy:
+        dest: /etc/containers/systemd/open-webui.container
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Open WebUI
+          After=network-online.target ollama.service
+          Wants=network-online.target
+          Requires=ollama.service
+
+          [Container]
+          Image=ghcr.io/open-webui/open-webui:main
+          ContainerName=open-webui
+          PublishPort={{ open_webui_port }}:8080
+          Volume={{ open_webui_dir }}/data:/app/backend/data:Z
+          Environment=OLLAMA_BASE_URL=http://host.containers.internal:11434
+          Environment=WEBUI_AUTH=True
+
+          [Service]
+          Restart=always
+          TimeoutStartSec=120
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd for quadlet
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start Open WebUI
+      ansible.builtin.systemd:
+        name: open-webui.service
+        enabled: true
+        state: started
+
+    - name: Open firewall for Open WebUI
+      ansible.posix.firewalld:
+        port: "{{ open_webui_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      ignore_errors: true
