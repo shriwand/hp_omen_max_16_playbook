@@ -6,6 +6,9 @@
 
   vars:
     target_user: "{{ ansible_user_id }}"
+    intel_wifi_pci_addr: "0000:03:00.0"
+    intel_wifi_vendor: "0x8086"
+    intel_wifi_device: "0x272b"
 
   tasks:
     - name: Update all packages
@@ -105,6 +108,77 @@
         DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ansible_facts['user_uid'] }}/bus"
       changed_when: true
 
+    - name: Fix brightness control for Hybrid/Nvidia mode (WMI method)
+      command: grubby --update-kernel=ALL --args="acpi_backlight=nvidia_wmi_ec"
+      register: grubby_result
+      changed_when: "'acpi_backlight=nvidia_wmi_ec' not in grubby_result.stdout"
+
+    - name: Install udev rule to disable D3cold for Intel Wi-Fi
+      ansible.builtin.copy:
+        dest: /etc/udev/rules.d/80-disable-wifi-d3cold.rules
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          ACTION=="add", SUBSYSTEM=="pci", KERNELS=="{{ intel_wifi_pci_addr }}", ATTR{vendor}=="{{ intel_wifi_vendor }}", ATTR{device}=="{{ intel_wifi_device }}", ATTR{d3cold_allowed}="0"
+
+    - name: Install system-sleep hook to re-apply D3cold setting after resume
+      ansible.builtin.copy:
+        dest: /etc/systemd/system-sleep/disable-wifi-d3cold.sh
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          dev="/sys/bus/pci/devices/{{ intel_wifi_pci_addr }}/d3cold_allowed"
+
+          case "$1" in
+            post)
+              [ -w "$dev" ] && echo 0 > "$dev"
+              ;;
+          esac
+
+          exit 0
+
+    - name: Install oneshot service to disable D3cold on boot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/disable-wifi-d3cold.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Disable D3cold for Intel Wi-Fi
+          After=systemd-udevd.service
+          ConditionPathExists=/sys/bus/pci/devices/{{ intel_wifi_pci_addr }}/d3cold_allowed
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c 'echo 0 > /sys/bus/pci/devices/{{ intel_wifi_pci_addr }}/d3cold_allowed'
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload udev rules
+      ansible.builtin.command: udevadm control --reload
+      changed_when: false
+
+    - name: Reload systemd and enable boot workaround
+      ansible.builtin.systemd:
+        name: disable-wifi-d3cold.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Read current d3cold_allowed value
+      ansible.builtin.command: cat /sys/bus/pci/devices/{{ intel_wifi_pci_addr }}/d3cold_allowed
+      register: wifi_d3cold_allowed
+      changed_when: false
+
+    - name: Show current d3cold_allowed value
+      ansible.builtin.debug:
+        msg: "d3cold_allowed={{ wifi_d3cold_allowed.stdout }}"      
+      
 #   - name: Reboot to load NVIDIA kernel modules
 #     ansible.builtin.reboot:
 #       msg: "Rebooting after NVIDIA driver installation"
