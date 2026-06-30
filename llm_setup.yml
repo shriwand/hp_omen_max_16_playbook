@@ -1,12 +1,67 @@
-- name: Install Ollama and Open WebUI on Fedora
+---
+- name: Install Ollama, Open WebUI and custom llama.cpp server on Fedora
   hosts: all
   become: true
   vars:
     ollama_listen: "0.0.0.0:11434"
+
     open_webui_port: 3000
     open_webui_dir: /opt/open-webui
     open_webui_user: openwebui
     open_webui_group: openwebui
+    open_webui_image: "ghcr.io/open-webui/open-webui:main"
+
+    llama_cpp_repo: "https://github.com/TheTom/llama-cpp-turboquant.git"
+    llama_cpp_version: "feature/turboquant-kv-cache"
+    llama_cpp_src_dir: /usr/local/src/llama-cpp-turboquant
+    llama_cpp_build_dir: /usr/local/src/llama-cpp-turboquant/build
+    llama_cpp_install_dir: /opt/llama-cpp-turboquant
+
+    llama_server_user: llamaserver
+    llama_server_group: llamaserver
+    llama_server_port: 8080
+    llama_server_host: "0.0.0.0"
+    llama_server_config_dir: /etc/llama-server
+    llama_server_models_dir: /var/lib/llama-server/models
+    llama_server_state_dir_name: llama-server
+
+    cuda_root: /usr/local/cuda
+    cuda_nvcc: /usr/local/cuda/bin/nvcc
+
+    llama_cuda_arch: "120"
+
+    resources_dir: "{{ playbook_dir }}/resources"
+
+    open_webui_enable_openai_api: true
+    open_webui_openai_api_base_url: "http://host.containers.internal:{{ llama_server_port }}/v1"
+    open_webui_openai_api_key: "not-required"
+
+    open_webui_env:
+      WEBUI_AUTH: "True"
+      ENABLE_SIGNUP: "True"
+      OLLAMA_BASE_URL: "http://host.containers.internal:11434"
+      OPENAI_API_BASE_URL: "{{ open_webui_openai_api_base_url }}"
+      OPENAI_API_KEY: "{{ open_webui_openai_api_key }}"
+
+  handlers:
+    - name: daemon reload
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart ollama
+      ansible.builtin.systemd:
+        name: ollama
+        state: restarted
+
+    - name: restart llama-server
+      ansible.builtin.systemd:
+        name: llama-server
+        state: restarted
+
+    - name: restart open-webui
+      ansible.builtin.systemd:
+        name: open-webui.service
+        state: restarted
 
   tasks:
     - name: Install required packages
@@ -15,8 +70,21 @@
           - curl
           - podman
           - python3-libselinux
+          - firewalld
+          - cmake
+          - git
+          - gcc-c++
+          - make
+          - ninja-build
+          - ccache
         state: present
         update_cache: true
+
+    - name: Ensure firewalld is enabled and started
+      ansible.builtin.systemd:
+        name: firewalld
+        enabled: true
+        state: started
 
     - name: Create group for Open WebUI
       ansible.builtin.group:
@@ -33,6 +101,21 @@
         shell: /sbin/nologin
         state: present
 
+    - name: Create group for llama-server
+      ansible.builtin.group:
+        name: "{{ llama_server_group }}"
+        system: true
+        state: present
+
+    - name: Create user for llama-server
+      ansible.builtin.user:
+        name: "{{ llama_server_user }}"
+        group: "{{ llama_server_group }}"
+        system: true
+        create_home: false
+        shell: /sbin/nologin
+        state: present
+
     - name: Create Open WebUI directories
       ansible.builtin.file:
         path: "{{ item }}"
@@ -43,6 +126,19 @@
       loop:
         - "{{ open_webui_dir }}"
         - "{{ open_webui_dir }}/data"
+
+    - name: Create llama-server directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ llama_cpp_install_dir }}", owner: "root", group: "root", mode: "0755" }
+        - { path: "{{ llama_server_config_dir }}", owner: "root", group: "root", mode: "0755" }
+        - { path: "{{ llama_server_models_dir }}", owner: "{{ llama_server_user }}", group: "{{ llama_server_group }}", mode: "0755" }
+        - { path: "{{ llama_cpp_src_dir }}", owner: "root", group: "root", mode: "0755" }
 
     - name: Install Ollama
       ansible.builtin.shell: |
@@ -66,16 +162,146 @@
           [Service]
           Environment="OLLAMA_HOST={{ ollama_listen }}"
           Environment="OLLAMA_ORIGINS=*"
+      notify:
+        - daemon reload
+        - restart ollama
 
-    - name: Reload systemd after Ollama override
-      ansible.builtin.systemd:
-        daemon_reload: true
-
-    - name: Enable and start Ollama
+    - name: Ensure Ollama is enabled and started
       ansible.builtin.systemd:
         name: ollama
         enabled: true
         state: started
+        daemon_reload: true
+
+    - name: Check nvcc presence
+      ansible.builtin.stat:
+        path: "{{ cuda_nvcc }}"
+      register: nvcc_stat
+
+    - name: Fail if nvcc is missing
+      ansible.builtin.fail:
+        msg: "nvcc not found at {{ cuda_nvcc }}. Install full CUDA toolkit first."
+      when: not nvcc_stat.stat.exists
+
+    - name: Checkout llama-cpp-turboquant
+      ansible.builtin.git:
+        repo: "{{ llama_cpp_repo }}"
+        dest: "{{ llama_cpp_src_dir }}"
+        version: "{{ llama_cpp_version }}"
+        update: true
+      register: llama_cpp_checkout
+
+    - name: Configure llama-cpp-turboquant
+      ansible.builtin.command:
+        cmd: >-
+          cmake -S {{ llama_cpp_src_dir }} -B {{ llama_cpp_build_dir }} -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CUDA_COMPILER={{ cuda_nvcc }}
+          -DCUDAToolkit_ROOT={{ cuda_root }}
+          -DGGML_CUDA=ON
+          -DCMAKE_CUDA_ARCHITECTURES={{ llama_cuda_arch }}
+          -DGGML_CUDA_GRAPHS=ON
+          -DGGML_CUDA_FA_ALL_QUANTS=ON
+          -DGGML_NATIVE=ON
+          -DBUILD_SHARED_LIBS=OFF
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+          -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler
+          -DCMAKE_INSTALL_PREFIX={{ llama_cpp_install_dir }}
+      environment:
+        PATH: "{{ cuda_root }}/bin:{{ ansible_env.PATH }}"
+        CUDACXX: "{{ cuda_nvcc }}"
+        CUDA_PATH: "{{ cuda_root }}"
+        CUDAToolkit_ROOT: "{{ cuda_root }}"
+      register: llama_cpp_configure
+      changed_when: "'Configuring done' in llama_cpp_configure.stdout or llama_cpp_checkout.changed"
+      notify: restart llama-server
+
+    - name: Build llama-cpp-turboquant
+      ansible.builtin.command:
+        cmd: cmake --build {{ llama_cpp_build_dir }} --parallel {{ ansible_processor_vcpus | default(8) }}
+      environment:
+        PATH: "{{ cuda_root }}/bin:{{ ansible_env.PATH }}"
+        CUDACXX: "{{ cuda_nvcc }}"
+        CUDA_PATH: "{{ cuda_root }}"
+        CUDAToolkit_ROOT: "{{ cuda_root }}"
+        NVCC_CCBIN: "{{ nvcc_ccbin }}"
+      when: llama_cpp_checkout.changed or llama_cpp_configure.changed
+      notify: restart llama-server
+
+    - name: Install llama-cpp-turboquant
+      ansible.builtin.command:
+        cmd: cmake --install {{ llama_cpp_build_dir }}
+      when: llama_cpp_checkout.changed or llama_cpp_configure.changed
+      notify: restart llama-server
+
+    - name: Verify llama-server binary exists
+      ansible.builtin.stat:
+        path: "{{ llama_cpp_install_dir }}/bin/llama-server"
+      register: llama_server_binary
+
+    - name: Fail if llama-server binary is missing
+      ansible.builtin.fail:
+        msg: "llama-server binary was not installed to {{ llama_cpp_install_dir }}/bin/llama-server"
+      when: not llama_server_binary.stat.exists
+
+    - name: Install llama-server models config
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/models.ini"
+        dest: "{{ llama_server_config_dir }}/models.ini"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart llama-server
+
+    - name: Install llama-server prompt template
+      ansible.builtin.copy:
+        src: "{{ resources_dir }}/qwen-aware-mimo-tool-template.jinja"
+        dest: "{{ llama_server_config_dir }}/qwen-aware-mimo-tool-template.jinja"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart llama-server
+
+    - name: Install llama-server systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/llama-server.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=llama.cpp turboquant server
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ llama_server_user }}
+          Group={{ llama_server_group }}
+          WorkingDirectory={{ llama_cpp_install_dir }}
+          StateDirectory={{ llama_server_state_dir_name }}
+          ConfigurationDirectory=llama-server
+          Environment=HOME=/var/lib/{{ llama_server_state_dir_name }}
+          Environment=LLAMA_SERVER_TEMPLATE={{ llama_server_config_dir }}/qwen-aware-mimo-tool-template.jinja
+          ExecStart={{ llama_cpp_install_dir }}/bin/llama-server --models-preset {{ llama_server_config_dir }}/models.ini --host {{ llama_server_host }} --port {{ llama_server_port }}
+          Restart=on-failure
+          RestartSec=3
+          LimitNOFILE=1048576
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=full
+          ProtectHome=true
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - daemon reload
+        - restart llama-server
+
+    - name: Enable and start llama-server
+      ansible.builtin.systemd:
+        name: llama-server
+        enabled: true
+        state: started
+        daemon_reload: true
 
     - name: Create quadlet directory
       ansible.builtin.file:
@@ -90,17 +316,20 @@
         content: |
           [Unit]
           Description=Open WebUI
-          After=network-online.target ollama.service
+          After=network-online.target ollama.service llama-server.service
           Wants=network-online.target
-          Requires=ollama.service
+          Requires=ollama.service llama-server.service
 
           [Container]
-          Image=ghcr.io/open-webui/open-webui:main
+          Image={{ open_webui_image }}
           ContainerName=open-webui
           PublishPort={{ open_webui_port }}:8080
           Volume={{ open_webui_dir }}/data:/app/backend/data:Z
-          Environment=OLLAMA_BASE_URL=http://host.containers.internal:11434
-          Environment=WEBUI_AUTH=True
+          Environment=WEBUI_AUTH={{ open_webui_env.WEBUI_AUTH }}
+          Environment=ENABLE_SIGNUP={{ open_webui_env.ENABLE_SIGNUP }}
+          Environment=OLLAMA_BASE_URL={{ open_webui_env.OLLAMA_BASE_URL }}
+          Environment=OPENAI_API_BASE_URL={{ open_webui_env.OPENAI_API_BASE_URL }}
+          Environment=OPENAI_API_KEY={{ open_webui_env.OPENAI_API_KEY }}
 
           [Service]
           Restart=always
@@ -108,16 +337,16 @@
 
           [Install]
           WantedBy=multi-user.target
-
-    - name: Reload systemd for quadlet
-      ansible.builtin.systemd:
-        daemon_reload: true
+      notify:
+        - daemon reload
+        - restart open-webui
 
     - name: Enable and start Open WebUI
       ansible.builtin.systemd:
         name: open-webui.service
         enabled: true
         state: started
+        daemon_reload: true
 
     - name: Open firewall for Open WebUI
       ansible.posix.firewalld:
@@ -125,4 +354,14 @@
         permanent: true
         immediate: true
         state: enabled
-      ignore_errors: true
+
+    - name: Optionally open firewall for llama-server
+      ansible.posix.firewalld:
+        port: "{{ llama_server_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      when: false
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers

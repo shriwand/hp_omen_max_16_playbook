@@ -1,0 +1,59 @@
+{%- if not tools is defined %}
+{%- set tools = none %}
+{%- endif %}
+{%- if not add_generation_prompt is defined %}
+{%- set add_generation_prompt = false %}
+{%- endif %}
+{%- set ns = namespace(system_prompt='') %}
+
+{%- for message in messages %}
+  {%- if message['role'] == 'system' %}
+    {%- if ns.system_prompt %}
+      {%- set ns.system_prompt = ns.system_prompt + '\n\n' + (message['content'] | trim) %}
+    {%- else %}
+      {%- set ns.system_prompt = message['content'] | trim %}
+    {%- endif %}
+  {%- endif %}
+{%- endfor %}
+
+{%- if tools %}
+{{- '<|im_start|>system\n' }}
+{%- if ns.system_prompt %}
+{{- ns.system_prompt }}
+{%- else %}
+{{- 'You are Qwen, created by Alibaba Cloud.\nYou are a helpful assistant.' }}
+{%- endif %}
+{{- "\n\n# Tools\n\nYou may call exactly one function at a time to assist with the user query.\nDo not emit more than one tool call in a single assistant message.\nDo not output analysis, reasoning, markdown, code fences, or plain text before or after a tool call.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+{%- for tool in tools %}
+{{- "\n" }}
+{{- tool | tojson }}
+{%- endfor %}
+{{- "\n</tools>\n\nFor each function call, return a JSON object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\nReturn exactly one <tool_call> block when a tool is needed.\nIf no tool is needed, respond normally in plain text.\n<|im_end|>\n" }}
+{%- else %}
+  {%- if ns.system_prompt %}
+{{- '<|im_start|>system\n' + ns.system_prompt + '<|im_end|>\n' }}
+  {%- else %}
+{{- '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud.\nYou are a helpful assistant.<|im_end|>\n' }}
+  {%- endif %}
+{%- endif %}
+
+{%- for message in messages %}
+  {%- if message['role'] == 'system' %}
+  {%- elif message['role'] == 'user' %}
+{{- '<|im_start|>user\n' + (message['content'] | trim) + '<|im_end|>\n' }}
+  {%- elif message['role'] == 'assistant' %}
+    {%- if message['tool_calls'] is defined and message['tool_calls'] %}
+{{- '<|im_start|>assistant\n<tool_call>\n' }}
+{{- {'name': message['tool_calls'][0]['function']['name'], 'arguments': (message['tool_calls'][0]['function']['arguments'] if message['tool_calls'][0]['function']['arguments'] is not string else (message['tool_calls'][0]['function']['arguments'] | from_json)) } | tojson }}
+{{- '\n</tool_call><|im_end|>\n' }}
+    {%- else %}
+{{- '<|im_start|>assistant\n' + (message['content'] | trim) + '<|im_end|>\n' }}
+    {%- endif %}
+  {%- elif message['role'] == 'tool' %}
+{{- '<|im_start|>user\n<tool_response>\n' + (message['content'] | trim) + '\n</tool_response><|im_end|>\n' }}
+  {%- endif %}
+{%- endfor %}
+
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n' }}
+{%- endif %}
